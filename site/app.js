@@ -5,6 +5,7 @@ const MIN_AREA_WEIGHT = 1;
 const MAX_AREA_WEIGHT = 2.67;
 const MIN_VIEWPORT_SCALE = 1;
 const MAX_VIEWPORT_SCALE = 4;
+const DEFAULT_INITIAL_VIEWPORT_SCALE = 2.35;
 const VIEWPORT_ZOOM_STEP = 1.35;
 const PANEL_PADDING = 18;
 const ROUTE_LINE_WIDTH = 2.2;
@@ -62,6 +63,7 @@ const state = {
   mobileHelpCollapsed: true,
   viewportScale: 1,
   viewportCenter: null,
+  panGesture: null,
   cursorPoint: null,
   cursorScreen: null,
   originPoint: null,
@@ -791,7 +793,7 @@ function parseSharedView() {
     parseCoordinatePair(searchParams.get("origin")) ||
     parseCoordinatePair(window.location.hash.replace(/^#/, ""));
   const probe = parseCoordinatePair(searchParams.get("distance"));
-  const zoomRaw = Number(searchParams.get("zoom"));
+  const zoomRaw = searchParams.has("zoom") ? Number(searchParams.get("zoom")) : NaN;
   const zoom = Number.isFinite(zoomRaw) ? clamp(zoomRaw, MIN_VIEWPORT_SCALE, MAX_VIEWPORT_SCALE) : null;
   const warp = searchParams.has("warp") ? searchParams.get("warp") !== "0" : null;
   const heatmap = searchParams.has("heatmap") ? searchParams.get("heatmap") !== "0" : null;
@@ -876,14 +878,13 @@ function pinMidpoint(a, b) {
 }
 
 function currentZoomFocusPoint() {
-  if (state.originPoint && state.probePoint) return pinMidpoint(state.originPoint, state.probePoint);
   if (state.originPoint) return state.originPoint.slice();
   return defaultMapCenter();
 }
 
 function activeViewportCenter() {
   if (state.viewportScale <= MIN_VIEWPORT_SCALE) return null;
-  return currentZoomFocusPoint();
+  return state.viewportCenter || currentZoomFocusPoint();
 }
 
 function buildTransform(bounds, width, height, padding = PANEL_PADDING, zoom = 1, centerPoint = null) {
@@ -1492,10 +1493,10 @@ function syncReachabilityScore(summary = null) {
   reachScoreCard.hidden = false;
   const percent = Math.round(summary.ratio * 100);
   const threshold = Math.round(currentTravelSettings().maxTransitTime);
-  reachScoreValue.textContent = `${summary.reachableStations} / ${summary.totalStations}`;
+  reachScoreValue.textContent = `${percent}%`;
   reachScoreMeta.textContent = `${percent}% of stops are reachable within ${threshold} minutes.`;
   if (mobileReachValue && mobileReachMeta) {
-    mobileReachValue.textContent = `${summary.reachableStations} / ${summary.totalStations}`;
+    mobileReachValue.textContent = `${percent}%`;
     mobileReachMeta.textContent = `${percent}% of stops are reachable within ${threshold} minutes.`;
   }
 }
@@ -2460,6 +2461,14 @@ function pointerToWorld(event) {
   return { screenPoint, worldPoint };
 }
 
+function clampViewportCenter(center) {
+  const [minX, minY, maxX, maxY] = state.data.meta.bounds;
+  return [
+    clamp(center[0], minX, maxX),
+    clamp(center[1], minY, maxY),
+  ];
+}
+
 function screenDistance(a, b) {
   return Math.hypot(a[0] - b[0], a[1] - b[1]);
 }
@@ -2614,14 +2623,41 @@ function handleDesktopPointerDown(event) {
   closeSettingsMenus();
   collapseMobileHelp();
   const { screenPoint, worldPoint } = pointerToWorld(event);
-  if (!withinBounds(worldPoint)) return;
-  beginPinGesture(event.pointerId, screenPoint, worldPoint, DESKTOP_PIN_HIT_RADIUS);
+  const pinTarget = hitPinTarget(screenPoint, DESKTOP_PIN_HIT_RADIUS);
+  if (pinTarget) {
+    beginPinGesture(event.pointerId, screenPoint, worldPoint, DESKTOP_PIN_HIT_RADIUS);
+  } else {
+    state.panGesture = {
+      pointerId: event.pointerId,
+      startScreen: screenPoint,
+      startWorld: worldPoint,
+      startCenter: (activeViewportCenter() || defaultMapCenter()).slice(),
+      hasPanned: false,
+    };
+    mapCanvas.classList.add("is-grabbing");
+  }
   mapCanvas.setPointerCapture(event.pointerId);
   requestDraw();
 }
 
 function handleDesktopPointerMove(event) {
   if (state.isMobile) return;
+  if (state.panGesture?.pointerId === event.pointerId) {
+    const rect = mapCanvas.getBoundingClientRect();
+    const screenPoint = [event.clientX - rect.left, event.clientY - rect.top];
+    const deltaX = screenPoint[0] - state.panGesture.startScreen[0];
+    const deltaY = screenPoint[1] - state.panGesture.startScreen[1];
+    if (state.panGesture.hasPanned || Math.hypot(deltaX, deltaY) > DESKTOP_PIN_TAP_SLOP) {
+      state.panGesture.hasPanned = true;
+      const scale = state.transform?.scale || 1;
+      state.viewportCenter = clampViewportCenter([
+        state.panGesture.startCenter[0] - deltaX / scale,
+        state.panGesture.startCenter[1] + deltaY / scale,
+      ]);
+      updateViewportTransform();
+    }
+    return;
+  }
   if (state.mobilePointerId !== event.pointerId || !state.mobileDragTarget) return;
   const { screenPoint, worldPoint } = pointerToWorld(event);
   if (!withinBounds(worldPoint)) return;
@@ -2629,7 +2665,36 @@ function handleDesktopPointerMove(event) {
 }
 
 function handleDesktopPointerUp(event) {
-  if (state.isMobile || state.mobilePointerId !== event.pointerId || !state.mobileDragTarget) return;
+  if (state.isMobile) return;
+  if (state.panGesture?.pointerId === event.pointerId) {
+    const didPan = state.panGesture.hasPanned;
+    const clickWorldPoint = state.panGesture.startWorld;
+    state.panGesture = null;
+    mapCanvas.classList.remove("is-grabbing");
+    try {
+      mapCanvas.releasePointerCapture(event.pointerId);
+    } catch (error) {
+      console.error(error);
+    }
+    if (!didPan && withinBounds(clickWorldPoint)) {
+      if (!state.originPoint) {
+        state.originLabel = null;
+        state.originPoint = clickWorldPoint;
+        state.pinnedPoint = clickWorldPoint;
+        state.pinned = true;
+        clearProbePoint();
+      } else {
+        setProbePoint(clickWorldPoint);
+        state.probePinned = true;
+      }
+      syncBrowserUrl();
+      state.dirty = true;
+      syncMobileSheet();
+      requestDraw();
+    }
+    return;
+  }
+  if (state.mobilePointerId !== event.pointerId || !state.mobileDragTarget) return;
 
   const dragTarget = state.mobileDragTarget;
   const moved = state.mobileGestureMoved;
@@ -2666,7 +2731,18 @@ function handleDesktopPointerUp(event) {
 }
 
 function handleDesktopPointerCancel(event) {
-  if (state.isMobile || state.mobilePointerId !== event.pointerId) return;
+  if (state.isMobile) return;
+  if (state.panGesture?.pointerId === event.pointerId) {
+    state.panGesture = null;
+    mapCanvas.classList.remove("is-grabbing");
+    try {
+      mapCanvas.releasePointerCapture(event.pointerId);
+    } catch (error) {
+      console.error(error);
+    }
+    return;
+  }
+  if (state.mobilePointerId !== event.pointerId) return;
   state.cursorScreen = null;
   state.cursorPoint = null;
   resetMobileGestureState();
@@ -2883,7 +2959,7 @@ async function init() {
       state.travelSettingsDefaults,
     );
   }
-  if (sharedView.zoom) {
+  if (sharedView.zoom !== null) {
     state.viewportScale = sharedView.zoom;
   }
   if (sharedView.warp !== null) {
@@ -2922,6 +2998,11 @@ async function init() {
         state.pinned = true;
       }
     }
+  }
+
+  if (sharedView.zoom === null && state.originPoint) {
+    state.viewportScale = DEFAULT_INITIAL_VIEWPORT_SCALE;
+    state.viewportCenter = state.originPoint.slice();
   }
 
   warpToggle.checked = state.showWarp;
