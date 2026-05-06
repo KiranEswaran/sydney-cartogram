@@ -1,10 +1,10 @@
 {
-  "name": "nyc-cartogram",
+  "name": "sydney-cartogram",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "login": "wrangler login"
+    "build:data": "python3 build_commute_site_data.py",
+    "dev": "python3 -m http.server 8000",
+    "build": "mkdir -p dist && cp -R site/* dist/"
   },
   "devDependencies": {
     "wrangler": "^4.83.0"

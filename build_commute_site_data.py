@@ -1,66 +1,107 @@
 #!/usr/bin/env python3
-"""Build compact data assets for the interactive commute-time website."""
+"""Build compact Sydney public-transport cartogram data from static TfNSW GTFS."""
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import statistics
+import time
 import zipfile
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
-from xml.etree import ElementTree as ET
+from typing import Iterable, Sequence
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-SITE_DATA_PATH = ROOT / "site" / "data" / "commute_map_data.json"
 
-BOROUGHS_PATH = DATA_DIR / "borough_boundaries.geojson"
+BOUNDARIES_PATH = DATA_DIR / "sydney_lga_boundaries.geojson"
 PARKS_PATH = DATA_DIR / "parks_open_space.geojson"
-STREETS_PATH = DATA_DIR / "osm_major_streets.json"
-GTFS_PATH = DATA_DIR / "mta_gtfs_subway.zip"
-COUNTIES_KML_ZIP_PATH = DATA_DIR / "cb_2024_us_county_500k.zip"
+STREETS_PATH = DATA_DIR / "osm_major_streets.geojson"
+GTFS_PATH = DATA_DIR / "tfnsw_gtfs_complete.zip"
+OUTPUT_PATH = ROOT / "site" / "data" / "commute_map_data.json"
+
+SYDNEY_BBOX = {
+    "min_lon": 150.45,
+    "min_lat": -34.25,
+    "max_lon": 151.45,
+    "max_lat": -33.35,
+}
 
 GRID_COLS = 160
 GRID_ROWS = 160
 MIN_PARK_AREA = 70_000.0
-# Keep walking assumptions close to a normal NYC walking pace so first/last-mile
-# time does not dominate otherwise reasonable subway trips.
+MAX_SHAPES_PER_ROUTE_DIRECTION = 1
+MAX_SHAPE_POINTS = 140
+
 WALK_METERS_PER_MINUTE = 80.0
-ACCESS_WALK_METERS_PER_MINUTE = 75.0
-STATION_ACCESS_PENALTY = 3.5
-CELL_NEAREST_STATIONS = 4
-ORIGIN_NEAREST_STATIONS = 5
-MAX_SHAPES_PER_ROUTE_DIRECTION = 2
-INTER_COMPLEX_WALK_RADIUS = 260.0
-INTER_COMPLEX_WALK_PENALTY = 2.0
-DEFAULT_BOARD_WAIT = 4.0
-TRANSFER_PENALTY = 4.0
-INTER_COMPLEX_TRANSFER_PENALTY = 7.0
-STATEN_ISLAND_FERRY_ROUTE_ID = "SIF"
-STATEN_ISLAND_FERRY_WAIT = 7.5
-STATEN_ISLAND_FERRY_TRAVEL_MINUTES = 25.0
-STATEN_ISLAND_FERRY_TERMINALS = ("501", "635")
+MAX_WALK_TO_TRANSIT_METERS = 900.0
+MAX_TRANSFER_WALK_METERS = 450.0
+MAX_TRANSFER_NEIGHBOURS_PER_STOP = 8
+MAX_ORIGIN_ACCESS_STOPS = 20
+CELL_NEAREST_STOPS = 12
+DEFAULT_TRANSFER_PENALTY_MINUTES = 5.0
+DEFAULT_BOARD_WAIT = 0.0
+STATION_ACCESS_PENALTY = 0.0
 
-Point = Tuple[float, float]
-Ring = List[Point]
-Polygon = List[Ring]
-MultiPolygon = List[Polygon]
+# TfNSW's current static bundle uses several extended route_type values.
+# 700 is regular bus. 712 school buses and 714 temporary replacement buses are
+# excluded from this representative "typical access" v1 graph.
+ROUTE_TYPE_TO_MODE = {
+    "0": "light_rail",
+    "1": "metro",
+    "2": "rail",
+    "3": "bus",
+    "4": "ferry",
+    "11": "bus",
+    "401": "metro",
+    "700": "bus",
+    "900": "light_rail",
+}
 
+WAIT_PENALTY_BY_MODE = {
+    "light_rail": 5.0,
+    "metro": 5.0,
+    "rail": 5.0,
+    "bus": 7.0,
+    "ferry": 10.0,
+}
 
-def round_point(point: Point) -> List[float]:
-    return [round(point[0], 1), round(point[1], 1)]
+MODE_LABELS = {
+    "rail": "Rail",
+    "metro": "Metro",
+    "light_rail": "Light rail",
+    "bus": "Bus",
+    "ferry": "Ferry",
+}
 
+MODE_FALLBACK_COLORS = {
+    "rail": "F99D1C",
+    "metro": "168388",
+    "light_rail": "DD1E25",
+    "bus": "00B5EF",
+    "ferry": "5AB031",
+}
 
-def round_path(points: Sequence[Point]) -> List[List[float]]:
-    return [round_point(point) for point in points]
+Point = tuple[float, float]
+Ring = list[Point]
+Polygon = list[Ring]
+MultiPolygon = list[Polygon]
 
 
 def load_json(path: Path) -> dict | list:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_csv_from_zip(gtfs_path: Path, member: str) -> Iterable[dict[str, str]]:
+    with zipfile.ZipFile(gtfs_path) as archive:
+        with archive.open(member) as handle:
+            reader = csv.DictReader(line.decode("utf-8-sig") for line in handle)
+            yield from reader
 
 
 def lonlat_to_xy(lon: float, lat: float, lat0: float) -> Point:
@@ -69,45 +110,49 @@ def lonlat_to_xy(lon: float, lat: float, lat0: float) -> Point:
     return lon * meters_per_deg_lon, lat * meters_per_deg_lat
 
 
-def average_borough_latitude(payload: dict) -> float:
-    total = 0.0
-    count = 0
-    for feature in payload["features"]:
-        geometry = feature["geometry"]
-        if geometry["type"] != "MultiPolygon":
-            continue
-        for polygon in geometry["coordinates"]:
-            for ring in polygon:
-                for _, lat in ring:
-                    total += lat
-                    count += 1
-    return total / max(count, 1)
+def round_point(point: Point) -> list[float]:
+    return [round(point[0], 1), round(point[1], 1)]
+
+
+def round_path(points: Sequence[Point]) -> list[list[float]]:
+    return [round_point(point) for point in points]
+
+
+def point_in_sydney_bbox(lon: float, lat: float) -> bool:
+    return (
+        SYDNEY_BBOX["min_lon"] <= lon <= SYDNEY_BBOX["max_lon"]
+        and SYDNEY_BBOX["min_lat"] <= lat <= SYDNEY_BBOX["max_lat"]
+    )
+
+
+def bbox_world(lat0: float) -> tuple[float, float, float, float]:
+    min_x, min_y = lonlat_to_xy(SYDNEY_BBOX["min_lon"], SYDNEY_BBOX["min_lat"], lat0)
+    max_x, max_y = lonlat_to_xy(SYDNEY_BBOX["max_lon"], SYDNEY_BBOX["max_lat"], lat0)
+    return min_x, min_y, max_x, max_y
 
 
 def ring_area(ring: Sequence[Point]) -> float:
     area = 0.0
-    for i in range(len(ring)):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % len(ring)]
-        area += x1 * y2 - x2 * y1
+    for index, point in enumerate(ring):
+        nxt = ring[(index + 1) % len(ring)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
     return area / 2.0
 
 
 def polygon_centroid(ring: Sequence[Point]) -> Point:
     area = ring_area(ring) or 1.0
-    factor = 1.0 / (6.0 * area)
     cx = 0.0
     cy = 0.0
-    for i in range(len(ring)):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % len(ring)]
-        cross = x1 * y2 - x2 * y1
-        cx += (x1 + x2) * cross
-        cy += (y1 + y2) * cross
+    factor = 1.0 / (6.0 * area)
+    for index, point in enumerate(ring):
+        nxt = ring[(index + 1) % len(ring)]
+        cross = point[0] * nxt[1] - nxt[0] * point[1]
+        cx += (point[0] + nxt[0]) * cross
+        cy += (point[1] + nxt[1]) * cross
     return cx * factor, cy * factor
 
 
-def simplify_polyline(points: Sequence[Point], min_distance: float) -> List[Point]:
+def simplify_polyline(points: Sequence[Point], min_distance: float) -> list[Point]:
     if len(points) <= 2:
         return list(points)
     simplified = [points[0]]
@@ -133,25 +178,17 @@ def simplify_ring(ring: Sequence[Point], min_distance: float) -> Ring:
     return simplified
 
 
-def bounds_of_ring(ring: Sequence[Point]) -> Tuple[float, float, float, float]:
-    xs = [x for x, _ in ring]
-    ys = [y for _, y in ring]
+def bounds_of_points(points: Sequence[Point]) -> tuple[float, float, float, float]:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def bounds_of_multipolygon(multipolygon: MultiPolygon) -> Tuple[float, float, float, float]:
-    xs = [x for polygon in multipolygon for ring in polygon for x, _ in ring]
-    ys = [y for polygon in multipolygon for ring in polygon for _, y in ring]
-    return min(xs), min(ys), max(xs), max(ys)
+def bounds_of_multipolygon(multipolygon: MultiPolygon) -> tuple[float, float, float, float]:
+    return bounds_of_points([point for polygon in multipolygon for ring in polygon for point in ring])
 
 
-def bounds_of_points(points: Sequence[Point]) -> Tuple[float, float, float, float]:
-    xs = [x for x, _ in points]
-    ys = [y for _, y in points]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def bbox_intersects(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+def bbox_intersects(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
 
@@ -159,8 +196,8 @@ def point_in_ring(point: Point, ring: Sequence[Point]) -> bool:
     x, y = point
     inside = False
     j = len(ring) - 1
-    for i in range(len(ring)):
-        xi, yi = ring[i]
+    for i, item in enumerate(ring):
+        xi, yi = item
         xj, yj = ring[j]
         intersects = (yi > y) != (yj > y)
         if intersects:
@@ -172,613 +209,734 @@ def point_in_ring(point: Point, ring: Sequence[Point]) -> bool:
 
 
 def point_in_polygon(point: Point, polygon: Polygon) -> bool:
-    if not polygon:
+    if not polygon or not point_in_ring(point, polygon[0]):
         return False
-    if not point_in_ring(point, polygon[0]):
-        return False
-    for hole in polygon[1:]:
-        if point_in_ring(point, hole):
-            return False
-    return True
+    return not any(point_in_ring(point, hole) for hole in polygon[1:])
 
 
 def point_in_multipolygon(point: Point, multipolygon: MultiPolygon) -> bool:
     return any(point_in_polygon(point, polygon) for polygon in multipolygon)
 
 
-def extract_boroughs(payload: dict, lat0: float) -> Tuple[list, MultiPolygon]:
-    boroughs = []
+def geojson_polygons(geometry: dict) -> list:
+    if not geometry:
+        return []
+    if geometry["type"] == "Polygon":
+        return [geometry["coordinates"]]
+    if geometry["type"] == "MultiPolygon":
+        return geometry["coordinates"]
+    return []
+
+
+def iter_lon_lat(payload: dict) -> Iterable[tuple[float, float]]:
+    for feature in payload.get("features", []):
+        for polygon in geojson_polygons(feature.get("geometry")):
+            for ring in polygon:
+                for lon, lat, *_ in ring:
+                    yield float(lon), float(lat)
+
+
+def average_geojson_latitude(payload: dict) -> float:
+    total = 0.0
+    count = 0
+    for _lon, lat in iter_lon_lat(payload):
+        total += lat
+        count += 1
+    if count:
+        return total / count
+    return (SYDNEY_BBOX["min_lat"] + SYDNEY_BBOX["max_lat"]) / 2
+
+
+def feature_name(feature: dict) -> str:
+    props = feature.get("properties") or {}
+    for key in ("GCCSA_NAME_2021", "LGA_NAME_2024", "LGA_NAME_2023", "LGA_NAME_2021", "name", "Name"):
+        if props.get(key):
+            return str(props[key])
+    return "Greater Sydney"
+
+
+def extract_boundaries(lat0: float) -> tuple[list[dict], MultiPolygon, bool]:
+    if not BOUNDARIES_PATH.exists():
+        min_x, min_y, max_x, max_y = bbox_world(lat0)
+        ring = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y), (min_x, min_y)]
+        polygon = [ring]
+        return (
+            [{"name": "Greater Sydney", "label": round_point(polygon_centroid(ring)), "polygons": [[round_path(ring)]]}],
+            [polygon],
+            False,
+        )
+
+    payload = load_json(BOUNDARIES_PATH)
+    areas = []
     all_polygons: MultiPolygon = []
-    for feature in payload["features"]:
-        geometry = feature["geometry"]
-        if geometry["type"] != "MultiPolygon":
-            continue
+    for feature in payload.get("features", []):
         multipolygon: MultiPolygon = []
-        for polygon_coords in geometry["coordinates"]:
+        for polygon_coords in geojson_polygons(feature.get("geometry")):
             polygon: Polygon = []
             for ring_coords in polygon_coords:
-                ring = [lonlat_to_xy(lon, lat, lat0) for lon, lat in ring_coords]
-                polygon.append(simplify_ring(ring, 120.0))
-            multipolygon.append(polygon)
-            all_polygons.append(polygon)
+                ring = [lonlat_to_xy(float(lon), float(lat), lat0) for lon, lat, *_ in ring_coords]
+                if len(ring) >= 4:
+                    polygon.append(simplify_ring(ring, 160.0))
+            if polygon:
+                multipolygon.append(polygon)
+                all_polygons.append(polygon)
+        if not multipolygon:
+            continue
         largest_polygon = max(multipolygon, key=lambda polygon: abs(ring_area(polygon[0])))
-        boroughs.append(
+        areas.append(
             {
-                "name": feature["properties"]["boroname"],
+                "name": feature_name(feature),
                 "label": round_point(polygon_centroid(largest_polygon[0])),
                 "polygons": [[round_path(ring) for ring in polygon] for polygon in multipolygon],
             }
         )
-    return boroughs, all_polygons
+    return areas, all_polygons, True
 
 
-def extract_parks(lat0: float, bbox: Tuple[float, float, float, float]) -> list:
+def extract_parks(lat0: float, bbox: tuple[float, float, float, float]) -> tuple[list, bool]:
     if not PARKS_PATH.exists():
-        return []
+        return [], False
     payload = load_json(PARKS_PATH)
     parks = []
-    for feature in payload["features"]:
+    for feature in payload.get("features", []):
+        props = feature.get("properties") or {}
         try:
-            area = float(feature["properties"].get("shape_area") or 0.0)
+            area = float(props.get("shape_area") or props.get("area") or props.get("AREA") or 0)
         except (TypeError, ValueError):
             area = 0.0
-        if area < MIN_PARK_AREA:
-            continue
-        geometry = feature.get("geometry")
-        if not geometry:
-            continue
-        polygons = []
-        if geometry["type"] == "Polygon":
-            polygons = [geometry["coordinates"]]
-        elif geometry["type"] == "MultiPolygon":
-            polygons = geometry["coordinates"]
-        for polygon_coords in polygons:
+        for polygon_coords in geojson_polygons(feature.get("geometry")):
             polygon: Polygon = []
             for ring_coords in polygon_coords:
-                ring = [lonlat_to_xy(lon, lat, lat0) for lon, lat in ring_coords]
-                polygon.append(simplify_ring(ring, 90.0))
-            if polygon and bbox_intersects(bounds_of_ring(polygon[0]), bbox):
-                parks.append([round_path(ring) for ring in polygon])
-    return parks
+                ring = [lonlat_to_xy(float(lon), float(lat), lat0) for lon, lat, *_ in ring_coords]
+                if len(ring) >= 4:
+                    polygon.append(simplify_ring(ring, 120.0))
+            if not polygon or not bbox_intersects(bounds_of_points(polygon[0]), bbox):
+                continue
+            if area and area < MIN_PARK_AREA:
+                continue
+            parks.append([round_path(ring) for ring in polygon])
+    return parks, bool(parks)
 
 
-def extract_streets(lat0: float, bbox: Tuple[float, float, float, float]) -> list:
+def extract_streets(lat0: float, bbox: tuple[float, float, float, float]) -> tuple[list, bool]:
     if not STREETS_PATH.exists():
-        return []
+        return [], False
     payload = load_json(STREETS_PATH)
-    allowed = {"motorway", "trunk", "primary"}
     streets = []
-    for element in payload.get("elements", []):
-        if element.get("type") != "way":
+    allowed = {"motorway", "trunk", "primary", "secondary"}
+    for feature in payload.get("features", []):
+        props = feature.get("properties") or {}
+        kind = props.get("highway") or props.get("class") or props.get("type")
+        if kind not in allowed:
             continue
-        tags = element.get("tags", {})
-        kind = tags.get("highway")
-        if kind not in allowed or "geometry" not in element or "name" not in tags:
-            continue
-        points = [lonlat_to_xy(node["lon"], node["lat"], lat0) for node in element["geometry"]]
-        if len(points) < 2:
-            continue
-        length = sum(distance for distance in (
-            math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
-            for i in range(len(points) - 1)
-        ))
-        if kind == "primary" and length < 900.0:
-            continue
-        simplified = simplify_polyline(points, 220.0)
-        if len(simplified) < 2 or not bbox_intersects(bounds_of_points(simplified), bbox):
-            continue
-        streets.append({"kind": kind, "name": tags["name"], "points": round_path(simplified)})
-    return streets
-
-
-def parse_kml_coordinates(text: str, lat0: float) -> Ring:
-    ring: Ring = []
-    for item in text.replace("\n", " ").split():
-        parts = item.split(",")
-        if len(parts) < 2:
-            continue
-        lon = float(parts[0])
-        lat = float(parts[1])
-        ring.append(lonlat_to_xy(lon, lat, lat0))
-    if ring and ring[0] != ring[-1]:
-        ring.append(ring[0])
-    return ring
-
-
-def build_external_land_polygons(
-    lat0: float,
-    bbox: Tuple[float, float, float, float],
-    borough_polygons: MultiPolygon,
-) -> list:
-    if not COUNTIES_KML_ZIP_PATH.exists():
-        return []
-
-    include_states = {"NY", "NJ", "CT"}
-    exclude_geoids = {"36005", "36047", "36061", "36081", "36085"}
-    namespace = {"kml": "http://www.opengis.net/kml/2.2"}
-    polygons = []
-
-    with zipfile.ZipFile(COUNTIES_KML_ZIP_PATH) as archive:
-      with archive.open("cb_2024_us_county_500k.kml") as handle:
-        for _, placemark in ET.iterparse(handle, events=("end",)):
-            if not placemark.tag.endswith("Placemark"):
+        geometry = feature.get("geometry") or {}
+        lines = []
+        if geometry.get("type") == "LineString":
+            lines = [geometry.get("coordinates") or []]
+        elif geometry.get("type") == "MultiLineString":
+            lines = geometry.get("coordinates") or []
+        for line in lines:
+            points = [lonlat_to_xy(float(lon), float(lat), lat0) for lon, lat, *_ in line]
+            if len(points) < 2 or not bbox_intersects(bounds_of_points(points), bbox):
                 continue
-            data = {
-                item.attrib.get("name"): (item.text or "")
-                for item in placemark.findall(".//kml:SimpleData", namespace)
-            }
-            geoid = data.get("GEOID")
-            stusps = data.get("STUSPS")
-            if geoid in exclude_geoids or stusps not in include_states:
-                placemark.clear()
-                continue
-
-            multipolygon: MultiPolygon = []
-            for polygon_node in placemark.findall(".//kml:Polygon", namespace):
-                rings = []
-                for ring_node in polygon_node.findall("./kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", namespace):
-                    ring = parse_kml_coordinates(ring_node.text or "", lat0)
-                    if len(ring) >= 4:
-                        rings.append(simplify_ring(ring, 120.0))
-                for ring_node in polygon_node.findall("./kml:innerBoundaryIs/kml:LinearRing/kml:coordinates", namespace):
-                    ring = parse_kml_coordinates(ring_node.text or "", lat0)
-                    if len(ring) >= 4:
-                        rings.append(simplify_ring(ring, 120.0))
-                if rings:
-                    multipolygon.append(rings)
-
-            visible_polygons = []
-            for polygon in multipolygon:
-                if not bbox_intersects(bounds_of_ring(polygon[0]), bbox):
-                    continue
-                if point_in_multipolygon(polygon_centroid(polygon[0]), borough_polygons):
-                    continue
-                visible_polygons.append([round_path(ring) for ring in polygon])
-            if visible_polygons:
-                polygons.extend(visible_polygons)
-            placemark.clear()
-
-    return polygons
+            streets.append(
+                {
+                    "kind": kind,
+                    "name": props.get("name") or "",
+                    "points": round_path(simplify_polyline(points, 220.0)),
+                }
+            )
+    return streets, bool(streets)
 
 
-def read_csv_from_zip(gtfs_path: Path, member: str) -> Iterable[dict]:
-    with zipfile.ZipFile(gtfs_path) as archive:
-        with archive.open(member) as handle:
-            reader = csv.DictReader(line.decode("utf-8-sig") for line in handle)
-            yield from reader
+def normalize_color(value: str, mode: str, route_id: str) -> str:
+    raw = (value or "").strip().strip("#")
+    if len(raw) == 6 and all(char in "0123456789abcdefABCDEF" for char in raw):
+        return f"#{raw.upper()}"
+    fallback = MODE_FALLBACK_COLORS.get(mode, "808183")
+    digest = hashlib.md5(route_id.encode("utf-8")).hexdigest()
+    # Blend mode color with a stable route hash so missing colors are distinct.
+    base = tuple(int(fallback[i : i + 2], 16) for i in (0, 2, 4))
+    tint = tuple(int(digest[i : i + 2], 16) for i in (0, 2, 4))
+    mixed = tuple(round(base[index] * 0.72 + tint[index] * 0.28) for index in range(3))
+    return "#" + "".join(f"{value:02X}" for value in mixed)
 
 
-def parse_gtfs_time(value: str) -> int:
-    hours, minutes, seconds = map(int, value.split(":"))
+def parse_gtfs_time(value: str) -> int | None:
+    try:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+    except (AttributeError, ValueError):
+        return None
     return hours * 3600 + minutes * 60 + seconds
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def build_station_data(lat0: float) -> Tuple[list, Dict[str, int], Dict[str, str]]:
-    complex_info: Dict[str, dict] = {}
-    stop_to_complex: Dict[str, str] = {}
-
-    for row in load_json(DATA_DIR / "subway_stations.json"):
-        complex_id = row["complex_id"]
-        stop_code = row["gtfs_stop_id"]
-        stop_to_complex[stop_code] = complex_id
-        stop_to_complex[f"{stop_code}N"] = complex_id
-        stop_to_complex[f"{stop_code}S"] = complex_id
-        info = complex_info.setdefault(
-            complex_id,
-            {
-                "id": complex_id,
-                "name": row["stop_name"],
-                "point": lonlat_to_xy(float(row["gtfs_longitude"]), float(row["gtfs_latitude"]), lat0),
-                "routes": set(),
-            },
-        )
-        routes = (row.get("daytime_routes") or "").split()
-        info["routes"].update(route for route in routes if route)
-
-    stations = []
-    station_index_by_id: Dict[str, int] = {}
-    for complex_id, info in sorted(complex_info.items(), key=lambda item: int(item[0])):
-        station_index_by_id[complex_id] = len(stations)
-        stations.append(info)
-
-    for row in read_csv_from_zip(GTFS_PATH, "stops.txt"):
-        stop_id = row["stop_id"]
-        parent_station = row.get("parent_station") or ""
-        if stop_id not in stop_to_complex and parent_station and parent_station in stop_to_complex:
-            stop_to_complex[stop_id] = stop_to_complex[parent_station]
-
-    return stations, station_index_by_id, stop_to_complex
-
-
-def build_routes_and_shapes(lat0: float, bbox: Tuple[float, float, float, float]) -> Tuple[dict, list, dict]:
-    route_styles = {}
+def load_routes() -> tuple[dict[str, dict], Counter]:
+    routes = {}
+    skipped = Counter()
     for row in read_csv_from_zip(GTFS_PATH, "routes.txt"):
-        if row.get("route_type") != "1" and row.get("route_id") != "SI":
+        raw_type = row.get("route_type") or ""
+        mode = ROUTE_TYPE_TO_MODE.get(raw_type)
+        if not mode:
+            skipped[raw_type] += 1
             continue
-        route_styles[row["route_id"]] = {
-            "color": f"#{row['route_color'] or '808183'}",
-            "textColor": f"#{row['route_text_color'] or 'FFFFFF'}",
-            "label": row["route_short_name"] or row["route_id"],
-        }
-
-    trips_by_id = {}
-    shape_counts: Dict[Tuple[str, str], Counter[str]] = {}
-    for row in read_csv_from_zip(GTFS_PATH, "trips.txt"):
         route_id = row["route_id"]
-        if route_id not in route_styles:
-            continue
-        trips_by_id[row["trip_id"]] = {
+        label = row.get("route_short_name") or row.get("route_long_name") or route_id
+        routes[route_id] = {
             "route_id": route_id,
-            "direction_id": row.get("direction_id", "0"),
-            "service_id": row.get("service_id", ""),
+            "agency_id": row.get("agency_id") or "",
+            "route_short_name": row.get("route_short_name") or "",
+            "route_long_name": row.get("route_long_name") or "",
+            "route_type": raw_type,
+            "mode": mode,
+            "mode_label": MODE_LABELS[mode],
+            "route_color": normalize_color(row.get("route_color") or "", mode, route_id),
+            "route_text_color": f"#{(row.get('route_text_color') or 'FFFFFF').strip('#')[:6] or 'FFFFFF'}",
+            "label": label,
         }
-        shape_counts.setdefault((route_id, row.get("direction_id", "0")), Counter())[row["shape_id"]] += 1
+    return routes, skipped
 
-    selected_shape_ids = {}
-    for (route_id, _direction), counter in shape_counts.items():
-        for shape_id, _count in counter.most_common(MAX_SHAPES_PER_ROUTE_DIRECTION):
-            selected_shape_ids[shape_id] = route_id
 
-    points_by_shape = defaultdict(list)
-    for row in read_csv_from_zip(GTFS_PATH, "shapes.txt"):
-        shape_id = row["shape_id"]
-        if shape_id not in selected_shape_ids:
+def load_stops(lat0: float) -> tuple[dict[str, dict], dict[str, dict], dict[str, str], set[str]]:
+    raw_stops = {}
+    parent_rows = {}
+    inside_stop_ids = set()
+    for row in read_csv_from_zip(GTFS_PATH, "stops.txt"):
+        try:
+            lat = float(row["stop_lat"])
+            lon = float(row["stop_lon"])
+        except (KeyError, TypeError, ValueError):
             continue
-        point = lonlat_to_xy(float(row["shape_pt_lon"]), float(row["shape_pt_lat"]), lat0)
-        points_by_shape[shape_id].append((int(row["shape_pt_sequence"]), point))
+        stop_id = row["stop_id"]
+        info = {
+            "id": stop_id,
+            "name": row.get("stop_name") or stop_id,
+            "lat": lat,
+            "lon": lon,
+            "point": lonlat_to_xy(lon, lat, lat0),
+            "location_type": row.get("location_type") or "",
+            "parent_station": row.get("parent_station") or None,
+            "wheelchair_boarding": row.get("wheelchair_boarding") or "",
+            "platform_code": row.get("platform_code") or "",
+        }
+        raw_stops[stop_id] = info
+        if info["location_type"] == "1":
+            parent_rows[stop_id] = info
+        if point_in_sydney_bbox(lon, lat):
+            inside_stop_ids.add(stop_id)
 
-    shapes = []
-    for shape_id, route_id in selected_shape_ids.items():
-        points = [point for _, point in sorted(points_by_shape.get(shape_id, []))]
-        points = simplify_polyline(points, 90.0)
-        if len(points) < 2 or not bbox_intersects(bounds_of_points(points), bbox):
+    node_for_stop = {}
+    for stop_id in inside_stop_ids:
+        stop = raw_stops[stop_id]
+        parent_id = stop.get("parent_station")
+        if parent_id and parent_id in raw_stops:
+            node_for_stop[stop_id] = parent_id
+        else:
+            node_for_stop[stop_id] = stop_id
+    return raw_stops, parent_rows, node_for_stop, inside_stop_ids
+
+
+def load_trips(routes: dict[str, dict]) -> tuple[dict[str, dict], dict[tuple[str, str], Counter[str]], int]:
+    trips = {}
+    shape_counts: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    for row in read_csv_from_zip(GTFS_PATH, "trips.txt"):
+        route_id = row.get("route_id") or ""
+        if route_id not in routes:
             continue
-        shapes.append(
-            {
-                "routeId": route_id,
-                "color": route_styles[route_id]["color"],
-                "textColor": route_styles[route_id]["textColor"],
-                "label": route_styles[route_id]["label"],
-                "points": round_path(points),
-            }
-        )
-    return route_styles, shapes, trips_by_id
-
-
-def build_route_waits(trips_by_id: dict) -> Dict[str, float]:
-    departures_by_route_service: Dict[Tuple[str, str], List[int]] = defaultdict(list)
-    current_trip_id = None
-    first_departure = None
-
-    for row in read_csv_from_zip(GTFS_PATH, "stop_times.txt"):
         trip_id = row["trip_id"]
-        stop_sequence = int(row["stop_sequence"])
-        if trip_id != current_trip_id:
-            if current_trip_id and first_departure is not None and current_trip_id in trips_by_id:
-                trip = trips_by_id[current_trip_id]
-                departures_by_route_service[(trip["route_id"], trip["service_id"])].append(first_departure)
-            current_trip_id = trip_id
-            first_departure = parse_gtfs_time(row["departure_time"]) if stop_sequence == 1 else None
-        elif stop_sequence == 1 and first_departure is None:
-            first_departure = parse_gtfs_time(row["departure_time"])
-
-    if current_trip_id and first_departure is not None and current_trip_id in trips_by_id:
-        trip = trips_by_id[current_trip_id]
-        departures_by_route_service[(trip["route_id"], trip["service_id"])].append(first_departure)
-
-    waits_by_route: Dict[str, List[float]] = defaultdict(list)
-    for (route_id, _service_id), departures in departures_by_route_service.items():
-        departures = sorted(set(departures))
-        gaps = [
-            (departures[i + 1] - departures[i]) / 60.0
-            for i in range(len(departures) - 1)
-            if 2 * 60 <= departures[i + 1] - departures[i] <= 30 * 60
-        ]
-        if gaps:
-            waits_by_route[route_id].append(statistics.median(gaps) / 2.0)
-
-    route_waits: Dict[str, float] = {}
-    for route_id, waits in waits_by_route.items():
-        route_waits[route_id] = round(clamp(statistics.median(waits), 1.5, 8.0), 2)
-    return route_waits
+        trips[trip_id] = {
+            "route_id": route_id,
+            "shape_id": row.get("shape_id") or "",
+            "direction_id": row.get("direction_id") or "0",
+            "service_id": row.get("service_id") or "",
+        }
+        shape_id = row.get("shape_id") or ""
+        if shape_id:
+            shape_counts[(route_id, row.get("direction_id") or "0")][shape_id] += 1
+    return trips, shape_counts, len(trips)
 
 
-def build_graph(
-    stations: list,
-    station_index_by_id: Dict[str, int],
-    stop_to_complex: Dict[str, str],
-    trips_by_id: dict,
-    route_waits: Dict[str, float],
-) -> Tuple[list, list, list]:
-    durations_by_edge: Dict[Tuple[int, int, str], List[float]] = defaultdict(list)
+def stop_node_info(node_id: str, raw_stops: dict[str, dict], children_by_parent: dict[str, list[str]]) -> dict:
+    source = raw_stops[node_id]
+    child_ids = children_by_parent.get(node_id) or [node_id]
+    child_points = [raw_stops[child_id]["point"] for child_id in child_ids if child_id in raw_stops]
+    if source.get("location_type") == "1" and child_points:
+        point = (
+            sum(point[0] for point in child_points) / len(child_points),
+            sum(point[1] for point in child_points) / len(child_points),
+        )
+    else:
+        point = source["point"]
+    return {
+        "id": node_id,
+        "name": source["name"],
+        "point": point,
+        "stop_ids": sorted(child_ids),
+        "routes": set(),
+        "modes": set(),
+    }
+
+
+def build_transit_edges(
+    trips: dict[str, dict],
+    routes: dict[str, dict],
+    raw_stops: dict[str, dict],
+    node_for_stop: dict[str, str],
+) -> tuple[dict[tuple[str, str, str], list[float]], dict[str, dict], Counter, int]:
+    durations_by_edge: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    parse_failures = Counter()
+    node_route_membership: dict[str, dict] = defaultdict(lambda: {"routes": set(), "modes": set()})
+    children_by_parent: dict[str, list[str]] = defaultdict(list)
+    for stop_id, node_id in node_for_stop.items():
+        children_by_parent[node_id].append(stop_id)
+
     current_trip_id = None
-    current_rows: List[dict] = []
+    current_rows: list[dict[str, str]] = []
+    trips_with_edges = 0
 
-    def process_trip(trip_id: str, rows: List[dict]) -> None:
-        trip = trips_by_id.get(trip_id)
-        if not trip or len(rows) < 2:
+    def process_trip(trip_id: str | None, rows: list[dict[str, str]]) -> None:
+        nonlocal trips_with_edges
+        if not trip_id or len(rows) < 2:
+            return
+        trip = trips.get(trip_id)
+        if not trip:
             return
         route_id = trip["route_id"]
-        ordered = sorted(rows, key=lambda row: int(row["stop_sequence"]))
+        route = routes[route_id]
+        ordered = sorted(rows, key=lambda item: int(item.get("stop_sequence") or 0))
+        local_edges = 0
         for row in ordered:
-            stop_id = row["stop_id"]
-            complex_id = stop_to_complex.get(stop_id)
-            if complex_id in station_index_by_id:
-                stations[station_index_by_id[complex_id]]["routes"].add(route_id)
+            node_id = node_for_stop.get(row.get("stop_id") or "")
+            if not node_id:
+                continue
+            node_route_membership[node_id]["routes"].add(route_id)
+            node_route_membership[node_id]["modes"].add(route["mode"])
         for prev, nxt in zip(ordered, ordered[1:]):
-            from_complex = stop_to_complex.get(prev["stop_id"])
-            to_complex = stop_to_complex.get(nxt["stop_id"])
-            if not from_complex or not to_complex or from_complex == to_complex:
+            from_node = node_for_stop.get(prev.get("stop_id") or "")
+            to_node = node_for_stop.get(nxt.get("stop_id") or "")
+            if not from_node or not to_node or from_node == to_node:
                 continue
-            if from_complex not in station_index_by_id or to_complex not in station_index_by_id:
+            departure = parse_gtfs_time(prev.get("departure_time") or prev.get("arrival_time") or "")
+            arrival = parse_gtfs_time(nxt.get("arrival_time") or nxt.get("departure_time") or "")
+            if departure is None or arrival is None:
+                parse_failures["bad_time"] += 1
                 continue
-            duration_seconds = parse_gtfs_time(nxt["arrival_time"]) - parse_gtfs_time(prev["departure_time"])
-            if 20 <= duration_seconds <= 1800:
-                from_index = station_index_by_id[from_complex]
-                to_index = station_index_by_id[to_complex]
-                durations_by_edge[(from_index, to_index, route_id)].append(duration_seconds / 60.0)
+            duration_seconds = arrival - departure
+            if duration_seconds < 0:
+                parse_failures["negative_duration"] += 1
+                continue
+            if not 10 <= duration_seconds <= 90 * 60:
+                parse_failures["implausible_duration"] += 1
+                continue
+            durations_by_edge[(from_node, to_node, route_id)].append(duration_seconds / 60.0)
+            local_edges += 1
+        if local_edges:
+            trips_with_edges += 1
 
     for row in read_csv_from_zip(GTFS_PATH, "stop_times.txt"):
-        trip_id = row["trip_id"]
+        trip_id = row.get("trip_id")
+        if trip_id not in trips:
+            continue
         if current_trip_id is None:
             current_trip_id = trip_id
         if trip_id != current_trip_id:
             process_trip(current_trip_id, current_rows)
             current_trip_id = trip_id
             current_rows = []
-        current_rows.append(row)
-    if current_trip_id and current_rows:
-        process_trip(current_trip_id, current_rows)
+        if row.get("stop_id") in node_for_stop:
+            current_rows.append(row)
+    process_trip(current_trip_id, current_rows)
+
+    nodes = {
+        node_id: stop_node_info(node_id, raw_stops, children_by_parent)
+        for node_id in node_route_membership
+        if node_id in raw_stops
+    }
+    for node_id, membership in node_route_membership.items():
+        if node_id not in nodes:
+            continue
+        nodes[node_id]["routes"].update(membership["routes"])
+        nodes[node_id]["modes"].update(membership["modes"])
+
+    return durations_by_edge, nodes, parse_failures, trips_with_edges
+
+
+def build_route_shapes(
+    lat0: float,
+    bbox: tuple[float, float, float, float],
+    routes: dict[str, dict],
+    shape_counts: dict[tuple[str, str], Counter[str]],
+) -> list[dict]:
+    selected_shape_ids = {}
+    for (route_id, _direction), counter in shape_counts.items():
+        if route_id not in routes:
+            continue
+        for shape_id, _count in counter.most_common(MAX_SHAPES_PER_ROUTE_DIRECTION):
+            selected_shape_ids[shape_id] = route_id
+
+    points_by_shape: dict[str, list[tuple[int, Point]]] = defaultdict(list)
+    for row in read_csv_from_zip(GTFS_PATH, "shapes.txt"):
+        shape_id = row.get("shape_id") or ""
+        route_id = selected_shape_ids.get(shape_id)
+        if not route_id:
+            continue
+        try:
+            lat = float(row["shape_pt_lat"])
+            lon = float(row["shape_pt_lon"])
+            sequence = int(float(row["shape_pt_sequence"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (
+            SYDNEY_BBOX["min_lon"] - 0.05 <= lon <= SYDNEY_BBOX["max_lon"] + 0.05
+            and SYDNEY_BBOX["min_lat"] - 0.05 <= lat <= SYDNEY_BBOX["max_lat"] + 0.05
+        ):
+            continue
+        points_by_shape[shape_id].append((sequence, lonlat_to_xy(lon, lat, lat0)))
+
+    shapes = []
+    seen = set()
+    for shape_id, route_id in selected_shape_ids.items():
+        points = [point for _sequence, point in sorted(points_by_shape.get(shape_id, []))]
+        if len(points) < 2:
+            continue
+        route = routes[route_id]
+        simplify_distance = 450.0 if route["mode"] == "bus" else 120.0
+        points = simplify_polyline(points, simplify_distance)
+        if len(points) > MAX_SHAPE_POINTS:
+            stride = math.ceil(len(points) / MAX_SHAPE_POINTS)
+            points = points[::stride]
+            if points[-1] != points_by_shape[shape_id][-1][1]:
+                points.append(points_by_shape[shape_id][-1][1])
+        if len(points) < 2 or not bbox_intersects(bounds_of_points(points), bbox):
+            continue
+        key = (route_id, tuple(round_point(points[0])), tuple(round_point(points[-1])))
+        if key in seen:
+            continue
+        seen.add(key)
+        shapes.append(
+            {
+                "routeId": route_id,
+                "mode": route["mode"],
+                "color": route["route_color"],
+                "textColor": route["route_text_color"],
+                "label": route["label"],
+                "points": round_path(points),
+            }
+        )
+    return shapes
+
+
+def build_graph(
+    nodes_by_id: dict[str, dict],
+    durations_by_edge: dict[tuple[str, str, str], list[float]],
+    routes: dict[str, dict],
+) -> tuple[list[dict], list[list[int]], list[list[list[float]]], dict[str, float], int]:
+    active_node_ids = sorted(nodes_by_id, key=lambda node_id: nodes_by_id[node_id]["name"])
+    node_index_by_id = {node_id: index for index, node_id in enumerate(active_node_ids)}
+    stations = [nodes_by_id[node_id] for node_id in active_node_ids]
+
+    route_waits = {
+        route_id: WAIT_PENALTY_BY_MODE[routes[route_id]["mode"]]
+        for route_id in routes
+    }
 
     route_states = []
-    state_index_by_key: Dict[Tuple[int, str], int] = {}
-    station_states: List[List[int]] = [[] for _ in stations]
+    state_index_by_key = {}
+    station_states: list[list[int]] = [[] for _ in stations]
     for station_index, station in enumerate(stations):
         for route_id in sorted(station["routes"]):
             state_index_by_key[(station_index, route_id)] = len(route_states)
             route_states.append({"stationIndex": station_index, "routeId": route_id})
-            station_states[station_index].append(state_index_by_key[(station_index, route_id)])
+            station_states[station_index].append(len(route_states) - 1)
 
-    adjacency = [dict() for _ in route_states]
-    for (from_station, to_station, route_id), durations in durations_by_edge.items():
+    adjacency_maps: list[dict[int, float]] = [dict() for _ in route_states]
+
+    def upsert(from_state: int, to_state: int, weight: float) -> None:
+        existing = adjacency_maps[from_state].get(to_state)
+        if existing is None or weight < existing:
+            adjacency_maps[from_state][to_state] = round(weight, 2)
+
+    for (from_node, to_node, route_id), durations in durations_by_edge.items():
+        if from_node not in node_index_by_id or to_node not in node_index_by_id:
+            continue
+        from_station = node_index_by_id[from_node]
+        to_station = node_index_by_id[to_node]
         from_state = state_index_by_key.get((from_station, route_id))
         to_state = state_index_by_key.get((to_station, route_id))
         if from_state is None or to_state is None:
             continue
-        weight = round(statistics.median(durations), 2)
-        existing = adjacency[from_state].get(to_state)
-        if existing is None or weight < existing:
-            adjacency[from_state][to_state] = weight
+        upsert(from_state, to_state, statistics.median(durations))
 
-    for station_index, state_indexes in enumerate(station_states):
-        for from_state in state_indexes:
-            for to_state in state_indexes:
+    for station_index, states in enumerate(station_states):
+        for from_state in states:
+            for to_state in states:
                 if from_state == to_state:
                     continue
                 to_route = route_states[to_state]["routeId"]
-                transfer_cost = round(TRANSFER_PENALTY + route_waits.get(to_route, DEFAULT_BOARD_WAIT), 2)
-                existing = adjacency[from_state].get(to_state)
-                if existing is None or transfer_cost < existing:
-                    adjacency[from_state][to_state] = transfer_cost
+                upsert(from_state, to_state, DEFAULT_TRANSFER_PENALTY_MINUTES + route_waits[to_route])
 
-    for i, source in enumerate(stations):
-        sx, sy = source["point"]
-        for j in range(i + 1, len(stations)):
-            tx, ty = stations[j]["point"]
-            distance = math.hypot(tx - sx, ty - sy)
-            if distance > INTER_COMPLEX_WALK_RADIUS:
-                continue
-            walk_minutes = distance / WALK_METERS_PER_MINUTE + INTER_COMPLEX_WALK_PENALTY
-            for from_state in station_states[i]:
-                for to_state in station_states[j]:
+    walking_transfer_edges = add_walking_transfers(stations, station_states, route_states, route_waits, adjacency_maps)
+    adjacency = [
+        [[to_index, weight] for to_index, weight in sorted(edges.items())]
+        for edges in adjacency_maps
+    ]
+    return route_states, station_states, adjacency, route_waits, walking_transfer_edges
+
+
+def add_walking_transfers(
+    stations: list[dict],
+    station_states: list[list[int]],
+    route_states: list[dict],
+    route_waits: dict[str, float],
+    adjacency_maps: list[dict[int, float]],
+) -> int:
+    bucket_size = MAX_TRANSFER_WALK_METERS
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, station in enumerate(stations):
+        x, y = station["point"]
+        buckets[(math.floor(x / bucket_size), math.floor(y / bucket_size))].append(index)
+
+    def upsert(from_state: int, to_state: int, weight: float) -> None:
+        existing = adjacency_maps[from_state].get(to_state)
+        if existing is None or weight < existing:
+            adjacency_maps[from_state][to_state] = round(weight, 2)
+
+    walking_edges = 0
+    for source_index, station in enumerate(stations):
+        sx, sy = station["point"]
+        bx = math.floor(sx / bucket_size)
+        by = math.floor(sy / bucket_size)
+        candidates = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for target_index in buckets.get((bx + dx, by + dy), []):
+                    if target_index == source_index:
+                        continue
+                    tx, ty = stations[target_index]["point"]
+                    meters = math.hypot(tx - sx, ty - sy)
+                    if meters <= MAX_TRANSFER_WALK_METERS:
+                        candidates.append((meters, target_index))
+        candidates.sort(key=lambda item: item[0])
+        for meters, target_index in candidates[:MAX_TRANSFER_NEIGHBOURS_PER_STOP]:
+            walk_minutes = meters / WALK_METERS_PER_MINUTE
+            for from_state in station_states[source_index]:
+                for to_state in station_states[target_index]:
                     to_route = route_states[to_state]["routeId"]
-                    from_route = route_states[from_state]["routeId"]
-                    forward_cost = round(
-                        walk_minutes + INTER_COMPLEX_TRANSFER_PENALTY + route_waits.get(to_route, DEFAULT_BOARD_WAIT),
-                        2,
+                    upsert(
+                        from_state,
+                        to_state,
+                        walk_minutes + DEFAULT_TRANSFER_PENALTY_MINUTES + route_waits[to_route],
                     )
-                    backward_cost = round(
-                        walk_minutes + INTER_COMPLEX_TRANSFER_PENALTY + route_waits.get(from_route, DEFAULT_BOARD_WAIT),
-                        2,
-                    )
-                    existing_forward = adjacency[from_state].get(to_state)
-                    existing_backward = adjacency[to_state].get(from_state)
-                    if existing_forward is None or forward_cost < existing_forward:
-                        adjacency[from_state][to_state] = forward_cost
-                    if existing_backward is None or backward_cost < existing_backward:
-                        adjacency[to_state][from_state] = backward_cost
-
-    return (
-        route_states,
-        station_states,
-        [
-            [[to_index, weight] for to_index, weight in sorted(edges.items())]
-            for edges in adjacency
-        ],
-    )
+                    walking_edges += 1
+    return walking_edges
 
 
-def add_staten_island_ferry(
-    stations: list,
-    station_index_by_id: Dict[str, int],
-    route_styles: Dict[str, dict],
-    route_shapes: list,
-    route_waits: Dict[str, float],
-    route_states: list,
-    station_states: List[List[int]],
-    adjacency: list,
-) -> None:
-    st_george_id, whitehall_id = STATEN_ISLAND_FERRY_TERMINALS
-    st_george_index = station_index_by_id.get(st_george_id)
-    whitehall_index = station_index_by_id.get(whitehall_id)
-    if st_george_index is None or whitehall_index is None:
-        return
-
-    route_styles[STATEN_ISLAND_FERRY_ROUTE_ID] = {
-        "color": "#4FB3BF",
-        "textColor": "#FFFFFF",
-        "label": "Ferry",
-    }
-    route_waits[STATEN_ISLAND_FERRY_ROUTE_ID] = STATEN_ISLAND_FERRY_WAIT
-
-    stations[st_george_index]["routes"].add(STATEN_ISLAND_FERRY_ROUTE_ID)
-    stations[whitehall_index]["routes"].add(STATEN_ISLAND_FERRY_ROUTE_ID)
-
-    start = stations[st_george_index]["point"]
-    end = stations[whitehall_index]["point"]
-    route_shapes.append(
-        {
-            "routeId": STATEN_ISLAND_FERRY_ROUTE_ID,
-            "color": route_styles[STATEN_ISLAND_FERRY_ROUTE_ID]["color"],
-            "textColor": route_styles[STATEN_ISLAND_FERRY_ROUTE_ID]["textColor"],
-            "label": route_styles[STATEN_ISLAND_FERRY_ROUTE_ID]["label"],
-            "points": round_path([start, end]),
-        }
-    )
-
-    st_george_state = len(route_states)
-    route_states.append({"stationIndex": st_george_index, "routeId": STATEN_ISLAND_FERRY_ROUTE_ID})
-    adjacency.append([])
-    station_states[st_george_index].append(st_george_state)
-
-    whitehall_state = len(route_states)
-    route_states.append({"stationIndex": whitehall_index, "routeId": STATEN_ISLAND_FERRY_ROUTE_ID})
-    adjacency.append([])
-    station_states[whitehall_index].append(whitehall_state)
-
-    def upsert_edge(from_state: int, to_state: int, weight: float) -> None:
-        for edge in adjacency[from_state]:
-            if edge[0] == to_state:
-                edge[1] = min(edge[1], weight)
-                return
-        adjacency[from_state].append([to_state, weight])
-
-    travel = round(STATEN_ISLAND_FERRY_TRAVEL_MINUTES, 2)
-    upsert_edge(st_george_state, whitehall_state, travel)
-    upsert_edge(whitehall_state, st_george_state, travel)
-
-    for station_index, ferry_state in ((st_george_index, st_george_state), (whitehall_index, whitehall_state)):
-        for other_state in station_states[station_index]:
-            if other_state == ferry_state:
-                continue
-            other_route = route_states[other_state]["routeId"]
-            to_other = round(TRANSFER_PENALTY + route_waits.get(other_route, DEFAULT_BOARD_WAIT), 2)
-            to_ferry = round(TRANSFER_PENALTY + route_waits.get(STATEN_ISLAND_FERRY_ROUTE_ID, DEFAULT_BOARD_WAIT), 2)
-            upsert_edge(ferry_state, other_state, to_other)
-            upsert_edge(other_state, ferry_state, to_ferry)
+def nearest_station_indexes(
+    point: Point,
+    stations: list[dict],
+    buckets: dict[tuple[int, int], list[int]],
+    radius: float,
+    limit: int,
+) -> list[int]:
+    bx = math.floor(point[0] / radius)
+    by = math.floor(point[1] / radius)
+    candidates = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for station_index in buckets.get((bx + dx, by + dy), []):
+                station = stations[station_index]
+                meters = math.hypot(station["point"][0] - point[0], station["point"][1] - point[1])
+                if meters <= radius:
+                    candidates.append((meters, station_index))
+    candidates.sort(key=lambda item: item[0])
+    return [station_index for _meters, station_index in candidates[:limit]]
 
 
-def build_grid_cells(polygons: MultiPolygon, stations: list, bbox: Tuple[float, float, float, float]) -> Tuple[list, list]:
+def build_grid_cells(polygons: MultiPolygon, stations: list[dict], bbox: tuple[float, float, float, float]) -> tuple[list, list]:
     min_x, min_y, max_x, max_y = bbox
     cell_w = (max_x - min_x) / GRID_COLS
     cell_h = (max_y - min_y) / GRID_ROWS
-    mask = []
+    bucket_radius = MAX_WALK_TO_TRANSIT_METERS
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, station in enumerate(stations):
+        x, y = station["point"]
+        buckets[(math.floor(x / bucket_radius), math.floor(y / bucket_radius))].append(index)
+
     cells = []
-    station_points = [station["point"] for station in stations]
+    mask = []
     for row in range(GRID_ROWS):
         for col in range(GRID_COLS):
-            x = min_x + (col + 0.5) * cell_w
-            y = min_y + (row + 0.5) * cell_h
-            point = (x, y)
+            point = (min_x + (col + 0.5) * cell_w, min_y + (row + 0.5) * cell_h)
             if not point_in_multipolygon(point, polygons):
                 mask.append(-1)
                 continue
-            ranked = sorted(
-                (
-                    (
-                        station_index,
-                        round(
-                            math.hypot(station_point[0] - x, station_point[1] - y) / ACCESS_WALK_METERS_PER_MINUTE
-                            + STATION_ACCESS_PENALTY,
-                            2,
-                        ),
-                    )
-                    for station_index, station_point in enumerate(station_points)
-                ),
-                key=lambda item: item[1],
-            )[:CELL_NEAREST_STATIONS]
+            access = nearest_station_indexes(point, stations, buckets, bucket_radius, CELL_NEAREST_STOPS)
             cells.append(
                 {
                     "col": col,
                     "row": row,
                     "point": round_point(point),
-                    "access": [[station_index, walk_minutes] for station_index, walk_minutes in ranked],
+                    "access": [[station_index, 0] for station_index in access],
                 }
             )
             mask.append(len(cells) - 1)
     return cells, mask
 
 
+def output_route_styles(routes: dict[str, dict]) -> dict[str, dict]:
+    return {
+        route_id: {
+            "agencyId": route["agency_id"],
+            "routeShortName": route["route_short_name"],
+            "routeLongName": route["route_long_name"],
+            "routeType": route["route_type"],
+            "mode": route["mode"],
+            "color": route["route_color"],
+            "textColor": route["route_text_color"],
+            "label": route["label"],
+        }
+        for route_id, route in routes.items()
+    }
+
+
+def file_size_label(path: Path) -> str:
+    size = path.stat().st_size
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 def main() -> None:
-    borough_payload = load_json(BOROUGHS_PATH)
-    lat0 = average_borough_latitude(borough_payload)
-    boroughs, all_polygons = extract_boroughs(borough_payload, lat0)
-    bbox = bounds_of_multipolygon(all_polygons)
-    external_land = build_external_land_polygons(lat0, bbox, all_polygons)
-    parks = extract_parks(lat0, bbox)
-    streets = extract_streets(lat0, bbox)
-    stations, station_index_by_id, stop_to_complex = build_station_data(lat0)
-    route_styles, route_shapes, trips_by_id = build_routes_and_shapes(lat0, bbox)
-    route_waits = build_route_waits(trips_by_id)
-    route_states, station_states, adjacency = build_graph(
-        stations, station_index_by_id, stop_to_complex, trips_by_id, route_waits
+    started = time.perf_counter()
+    if not GTFS_PATH.exists():
+        raise FileNotFoundError(f"Missing TfNSW GTFS ZIP at {GTFS_PATH}")
+
+    boundary_payload = load_json(BOUNDARIES_PATH) if BOUNDARIES_PATH.exists() else {"features": []}
+    lat0 = average_geojson_latitude(boundary_payload)
+    areas, all_polygons, boundary_loaded = extract_boundaries(lat0)
+    bbox = bounds_of_multipolygon(all_polygons) if boundary_loaded else bbox_world(lat0)
+    parks, parks_loaded = extract_parks(lat0, bbox)
+    streets, streets_loaded = extract_streets(lat0, bbox)
+
+    routes, skipped_route_types = load_routes()
+    raw_stops, _parent_rows, node_for_stop, _inside_stop_ids = load_stops(lat0)
+    trips, shape_counts, selected_trip_count = load_trips(routes)
+    durations_by_edge, nodes_by_id, parse_failures, trips_with_edges = build_transit_edges(
+        trips, routes, raw_stops, node_for_stop
     )
-    add_staten_island_ferry(
-        stations,
-        station_index_by_id,
-        route_styles,
-        route_shapes,
-        route_waits,
-        route_states,
-        station_states,
-        adjacency,
+
+    # Retain only routes that actually contribute to in-bbox Sydney graph nodes.
+    active_route_ids = {route_id for node in nodes_by_id.values() for route_id in node["routes"]}
+    routes = {route_id: route for route_id, route in routes.items() if route_id in active_route_ids}
+    route_shapes = build_route_shapes(lat0, bbox, routes, shape_counts)
+    route_states, station_states, adjacency, route_waits, walking_transfer_edges = build_graph(
+        nodes_by_id,
+        durations_by_edge,
+        routes,
     )
+    stations = [
+        {
+            "id": station["id"],
+            "name": station["name"],
+            "point": round_point(station["point"]),
+            "routes": sorted(route_id for route_id in station["routes"] if route_id in routes),
+            "modes": sorted(station["modes"]),
+            "stopIds": station["stop_ids"],
+        }
+        for station in sorted(nodes_by_id.values(), key=lambda item: item["name"])
+    ]
     cells, mask = build_grid_cells(all_polygons, stations, bbox)
 
+    modes_present = sorted({route["mode"] for route in routes.values()})
+    routes_by_mode = Counter(route["mode"] for route in routes.values())
     output = {
+        "metadata": {
+            "city": "Sydney",
+            "source": "TfNSW Timetables Complete GTFS",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "static_not_realtime": True,
+            "schedule_aware": False,
+            "modes_included": modes_present,
+            "default_max_time_minutes": 90,
+            "max_supported_time_minutes": 120,
+            "route_type_mapping": ROUTE_TYPE_TO_MODE,
+            "excluded_route_types": dict(skipped_route_types),
+            "default_origin": {"name": "Central Station", "lat": -33.8826, "lon": 151.2069},
+        },
         "meta": {
             "lat0": round(lat0, 6),
             "bounds": [round(value, 1) for value in bbox],
             "gridCols": GRID_COLS,
             "gridRows": GRID_ROWS,
             "walkMetersPerMinute": WALK_METERS_PER_MINUTE,
-            "accessWalkMetersPerMinute": ACCESS_WALK_METERS_PER_MINUTE,
+            "accessWalkMetersPerMinute": WALK_METERS_PER_MINUTE,
+            "maxWalkToTransitMeters": MAX_WALK_TO_TRANSIT_METERS,
             "stationAccessPenalty": STATION_ACCESS_PENALTY,
-            "originStationCount": ORIGIN_NEAREST_STATIONS,
-            "cellNearestStations": CELL_NEAREST_STATIONS,
+            "originStationCount": MAX_ORIGIN_ACCESS_STOPS,
+            "cellNearestStations": CELL_NEAREST_STOPS,
             "defaultBoardWait": DEFAULT_BOARD_WAIT,
-            "transferPenalty": TRANSFER_PENALTY,
-            "interComplexTransferPenalty": INTER_COMPLEX_TRANSFER_PENALTY,
+            "transferPenalty": DEFAULT_TRANSFER_PENALTY_MINUTES,
+            "interComplexTransferPenalty": DEFAULT_TRANSFER_PENALTY_MINUTES,
         },
-        "boroughs": boroughs,
-        "externalLand": external_land,
+        "boroughs": areas,
+        "externalLand": [],
         "parks": parks,
         "streets": streets,
         "routes": route_shapes,
-        "stations": [
-            {
-                "id": station["id"],
-                "name": station["name"],
-                "point": round_point(station["point"]),
-                "routes": sorted(station["routes"]),
-            }
-            for station in stations
-        ],
+        "stations": stations,
         "routeStates": route_states,
         "stationStates": station_states,
         "routeWaits": route_waits,
         "adjacency": adjacency,
         "cells": cells,
         "mask": mask,
-        "routeStyles": route_styles,
+        "routeStyles": output_route_styles(routes),
+        "modes": {
+            mode: {
+                "label": MODE_LABELS[mode],
+                "color": f"#{MODE_FALLBACK_COLORS[mode]}",
+                "waitPenaltyMinutes": WAIT_PENALTY_BY_MODE[mode],
+            }
+            for mode in modes_present
+        },
+        "buildReport": {},
     }
 
-    SITE_DATA_PATH.write_text(json.dumps(output, separators=(",", ":")), encoding="utf-8")
-    print(f"Wrote {SITE_DATA_PATH}")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(output, separators=(",", ":")), encoding="utf-8")
+    build_seconds = time.perf_counter() - started
+    output["buildReport"] = {
+        "generatedJsonSize": file_size_label(OUTPUT_PATH),
+        "buildTimeSeconds": round(build_seconds, 2),
+        "totalStops": len(stations),
+        "totalParentStationsOrComplexes": sum(1 for station in stations if len(station.get("stopIds") or []) > 1),
+        "routesByMode": dict(sorted(routes_by_mode.items())),
+        "totalTripsParsed": trips_with_edges,
+        "selectedTrips": selected_trip_count,
+        "transitEdges": len(durations_by_edge),
+        "walkingTransferEdges": walking_transfer_edges,
+        "gridCells": len(cells),
+        "gtfsParseFailures": dict(parse_failures),
+        "boundaryLayerLoaded": boundary_loaded,
+        "streetLayerLoaded": streets_loaded,
+        "parksLayerLoaded": parks_loaded,
+    }
+    OUTPUT_PATH.write_text(json.dumps(output, separators=(",", ":")), encoding="utf-8")
+
+    print(f"Wrote {OUTPUT_PATH}")
+    print(f"Generated JSON size: {file_size_label(OUTPUT_PATH)}")
+    print(f"Build time: {build_seconds:.2f}s")
+    print(f"Total stops: {len(stations)}")
+    print(f"Total parent stations/complexes: {output['buildReport']['totalParentStationsOrComplexes']}")
+    print(f"Total routes by mode: {dict(sorted(routes_by_mode.items()))}")
+    print(f"Total trips parsed: {trips_with_edges}")
+    print(f"Total transit edges: {len(durations_by_edge)}")
+    print(f"Total walking-transfer edges: {walking_transfer_edges}")
+    print(f"GTFS parse failures/skipped rows: {dict(parse_failures)}")
+    print(f"Boundary layer loaded: {'yes' if boundary_loaded else 'no'}")
+    print(f"Street layer loaded: {'yes' if streets_loaded else 'no'}")
+    print(f"Parks layer loaded: {'yes' if parks_loaded else 'no'}")
 
 
 if __name__ == "__main__":

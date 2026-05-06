@@ -1,144 +1,119 @@
-# NYC Cartogram
+# Sydney Transit Time Cartogram
 
-This project generates two related artifacts for New York City:
+Interactive Greater Sydney public-transport accessibility map forked from
+[`AntCas/nyc-cartogram`](https://github.com/AntCas/nyc-cartogram).
 
-- a static SVG cartogram that expands places with stronger subway access and compresses places with weaker access
-- an interactive commute-time web app that lets you pin an origin, inspect travel times, toggle the warp and heatmap layers, and share deep links to a view
+The app renders a static, browser-only heatmap/cartogram from preprocessed TfNSW GTFS data. It
+includes trains, metro, light rail, regular buses, and ferries.
 
-Live site: [castrio.me/nyc](https://castrio.me/nyc/)
+## Data Sources
 
-<img width="1080" height="1350" alt="nyc-commute-cartogram-1776285343768" src="https://github.com/user-attachments/assets/e5324236-2a0e-48cd-b504-143b4cedc457" />
+- TfNSW Timetables Complete GTFS: <https://opendata.transport.nsw.gov.au/dataset/timetables-complete-gtfs>
+- ABS ASGS Greater Sydney boundary via ABS ArcGIS services: <https://geo.abs.gov.au/>
+- Optional cosmetic layers:
+  - `data/osm_major_streets.geojson`
+  - `data/parks_open_space.geojson`
 
-## What The Project Uses
-
-- NYC borough boundaries
-- MTA GTFS subway data for stations, routes, and travel times
-- major streets and park/open-space overlays for the basemap
-- a distance-based warp for the static SVG
-- a station-to-station network plus walking access model for the interactive commute map
-
-The interactive app includes the Staten Island Ferry connection, but it does not model buses, regional rail, or real-time schedules.
-
-## Requirements
-
-- Python 3
-- `pnpm` and Node.js only if you want to run or deploy the Cloudflare Worker
-
-Both Python scripts use the standard library only, so there is no Python dependency install step.
-
-## Generate The Static SVG
-
-Run:
+The raw GTFS ZIP is expected at:
 
 ```bash
-python3 generate_nyc_subway_weighted_projection.py
+data/tfnsw_gtfs_complete.zip
 ```
 
-Output:
+Raw GTFS is ignored by Git. The generated compact bundle is:
 
-```text
-output/nyc_subway_weighted_projection.svg
+```bash
+site/data/commute_map_data.json
 ```
 
-Notes:
+## API Keys
 
-- If `data/borough_boundaries.geojson` is missing, the script can fetch borough boundaries automatically.
-- The other source files are expected under `data/`.
+The preferred v1 workflow is a one-off local GTFS download followed by local preprocessing. No TfNSW
+API key is required by the browser app, and no key should be committed.
 
-## Build The Interactive Site Data
+If a future workflow needs an API key, store it only in `.env`:
 
-Run:
+```bash
+TFNSW_API_KEY=replace_with_real_key
+```
+
+Do not reference that key from client-side JavaScript.
+
+## Build Data
 
 ```bash
 python3 build_commute_site_data.py
 ```
 
-Output:
+or:
 
-```text
-site/data/commute_map_data.json
+```bash
+npm run build:data
 ```
 
-This produces the compact data bundle consumed by the front-end app in `site/`.
+The build prints JSON size, build time, stop counts, routes by mode, trip counts, transit edges,
+walking-transfer edges, parse failures, and optional layer status.
 
 ## Local Preview
-
-For a simple static preview:
 
 ```bash
 python3 -m http.server 8000
 ```
 
-Then open:
+or:
+
+```bash
+npm run dev
+```
+
+Open:
 
 ```text
 http://localhost:8000/site/
 ```
 
-Useful local-preview notes:
+Address search uses OpenStreetMap Nominatim at runtime with a Sydney/Australia bias.
 
-- The site loads its data from `site/data/commute_map_data.json`.
-- Address search uses OpenStreetMap Nominatim at runtime, so that feature needs internet access.
-- On plain static localhost, production-style URLs like `/nyc/@40.71267,-73.92366` are not available. Use query-string sharing there instead.
-
-## Cloudflare Worker Dev And Deploy
-
-Install the Worker tooling:
+## Static Build
 
 ```bash
-pnpm install
+npm run build
 ```
 
-Run the Worker locally:
+This copies `site/` to `dist/`.
 
-```bash
-pnpm run dev
-```
+## Vercel
 
-Deploy:
+This project is configured as a static Vercel app with `vercel.json`:
 
-```bash
-pnpm run deploy
-```
+- build command: `npm run build`
+- output directory: `dist`
+- route rewrites for `/sydney/@lat,lon` deep links
 
-This repo includes:
-
-- [wrangler.jsonc](/Users/primaryuser/Desktop/nyc-projection/wrangler.jsonc) to bundle the `site/` directory as Worker assets
-- [src/worker.js](/Users/primaryuser/Desktop/nyc-projection/src/worker.js) to serve the app from the `/nyc` path prefix on `castrio.me`
-
-Deployment behavior:
-
-- The Worker serves the app at `https://castrio.me/nyc/`.
-- Requests to `/nyc` are normalized to `/nyc/`.
-- Asset requests under `/nyc/...` are rewritten to bundled assets from `site/`.
-- Pretty origin routes like `https://castrio.me/nyc/@40.71267,-73.92366` are handled by the Worker because route-like paths fall back to `site/index.html`.
-
-If this is your first local `pnpm` install and Wrangler postinstall steps were blocked, run `pnpm approve-builds` and approve the relevant packages before deploying again.
+For v1, generate `site/data/commute_map_data.json` locally and deploy the static bundle. Avoid
+processing the full TfNSW GTFS ZIP during Vercel builds unless you explicitly accept the build-time
+cost and configure secrets in Vercel environment variables.
 
 ## Project Layout
 
-- [generate_nyc_subway_weighted_projection.py](/Users/primaryuser/Desktop/nyc-projection/generate_nyc_subway_weighted_projection.py): builds the static SVG cartogram
-- [build_commute_site_data.py](/Users/primaryuser/Desktop/nyc-projection/build_commute_site_data.py): builds the interactive site data bundle
-- [site/index.html](/Users/primaryuser/Desktop/nyc-projection/site/index.html): app shell and metadata
-- [site/app.js](/Users/primaryuser/Desktop/nyc-projection/site/app.js): interactive map, search, sharing, and rendering logic
-- [site/styles.css](/Users/primaryuser/Desktop/nyc-projection/site/styles.css): site styles
-- [site/data/commute_map_data.json](/Users/primaryuser/Desktop/nyc-projection/site/data/commute_map_data.json): generated site dataset
-- [src/worker.js](/Users/primaryuser/Desktop/nyc-projection/src/worker.js): Cloudflare Worker entrypoint
+- `build_commute_site_data.py`: converts TfNSW static GTFS and optional geography layers into the compact site bundle
+- `site/index.html`: app shell and metadata
+- `site/app.js`: interactive map, routing, search, sharing, heatmap, and warp rendering
+- `site/styles.css`: app styles
+- `site/data/commute_map_data.json`: generated Sydney dataset
+- `vercel.json`: static Vercel deployment config
 
-## Current App Behavior
+## Limitations
 
-- hover or tap to choose an origin
-- pin an origin and inspect commute times back to that point
-- toggle warp and heatmap layers
-- zoom and full-screen the map
-- search for NYC addresses
-- use browser geolocation when available
-- export and share views, including deep links
-- display a 60-minute reachability score
+This is an approximate static public-transport accessibility visualisation.
+It is not realtime.
+It is not time-of-day-aware.
+It does not account for service disruptions, trackwork, cancellations, or live delays.
+Travel times are derived from static GTFS and simplified transfer/walking assumptions.
 
-## Notes
+Additional implementation notes:
 
-- The map uses a shared geographic projection across boroughs, stations, route shapes, parks, and streets so layers stay aligned.
-- For the interactive app, travel times are based on subway travel plus walking access to and from stations.
-- Borough labels are placed from each borough's largest polygon to keep labels stable for fragmented geometries.
-- Some UI/share icons are from [Iconmonstr](https://iconmonstr.com/).
+- Regular bus routes are included. School-only and temporary replacement bus route types are excluded from the representative graph.
+- Wait time is approximated by fixed mode penalties, not exact timetable transfer optimisation.
+- Walking transfers are capped by distance and neighbour count to keep the browser graph responsive.
+- The static SVG cartogram generator from the original NYC project is retained but not ported for Sydney v1.

@@ -1,5 +1,5 @@
-const PATH_PREFIX = "/nyc";
-const DIAGNOSTIC_HEADER = "x-nyc-cartogram-worker";
+const PATH_PREFIX = "/sydney";
+const DIAGNOSTIC_HEADER = "x-sydney-cartogram-worker";
 
 function withoutPrefix(pathname) {
   if (pathname === PATH_PREFIX || pathname === `${PATH_PREFIX}/`) return "/";
