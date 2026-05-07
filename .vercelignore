@@ -1,3 +1,5 @@
 recordings/
+reviews/
+.playwright-mcp/
 data/tfnsw_gtfs_complete.zip
 .env

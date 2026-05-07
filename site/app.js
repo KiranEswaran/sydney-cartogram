@@ -6,6 +6,7 @@ const MAX_AREA_WEIGHT = 2.67;
 const MIN_VIEWPORT_SCALE = 1;
 const MAX_VIEWPORT_SCALE = 4;
 const DEFAULT_INITIAL_VIEWPORT_SCALE = 2.35;
+const DESKTOP_INITIAL_CENTER_OFFSET_METERS = [-11_000, 0];
 const VIEWPORT_ZOOM_STEP = 1.35;
 const PANEL_PADDING = 18;
 const ROUTE_LINE_WIDTH = 2.2;
@@ -885,6 +886,15 @@ function currentZoomFocusPoint() {
 function activeViewportCenter() {
   if (state.viewportScale <= MIN_VIEWPORT_SCALE) return null;
   return state.viewportCenter || currentZoomFocusPoint();
+}
+
+function initialViewportCenterForOrigin(originPoint) {
+  if (!originPoint) return null;
+  if (state.isMobile) return originPoint.slice();
+  return clampViewportCenter([
+    originPoint[0] + DESKTOP_INITIAL_CENTER_OFFSET_METERS[0],
+    originPoint[1] + DESKTOP_INITIAL_CENTER_OFFSET_METERS[1],
+  ]);
 }
 
 function buildTransform(bounds, width, height, padding = PANEL_PADDING, zoom = 1, centerPoint = null) {
@@ -1936,7 +1946,7 @@ function drawMap(drawCtx, width, height) {
   const warpPoint = state.showWarp && warp ? warp.warpPoint : (point) => point;
   const inverseWarpPoint = warp ? warp.inverseWarpPoint : (point) => point;
   const warpedBounds = state.showWarp && warp ? warp.warpedBounds : state.data.meta.bounds;
-  const zoomFocusPoint = state.viewportScale > MIN_VIEWPORT_SCALE ? currentZoomFocusPoint() : null;
+  const zoomFocusPoint = state.viewportScale > MIN_VIEWPORT_SCALE ? activeViewportCenter() : null;
   const anchorScreen = zoomFocusPoint
     ? [width / 2, height / 2]
     : state.showWarp && state.pinned && !state.isMobile
@@ -2434,8 +2444,9 @@ function updateViewportTransform() {
 
 function setViewportScale(nextScale) {
   const clampedScale = clamp(nextScale, MIN_VIEWPORT_SCALE, MAX_VIEWPORT_SCALE);
+  const center = activeViewportCenter() || currentZoomFocusPoint();
   state.viewportScale = clampedScale;
-  state.viewportCenter = clampedScale > MIN_VIEWPORT_SCALE ? currentZoomFocusPoint() : null;
+  state.viewportCenter = clampedScale > MIN_VIEWPORT_SCALE ? center : null;
   state.pinnedScreen = null;
   syncBrowserUrl();
   updateViewportTransform();
@@ -3002,7 +3013,7 @@ async function init() {
 
   if (sharedView.zoom === null && state.originPoint) {
     state.viewportScale = DEFAULT_INITIAL_VIEWPORT_SCALE;
-    state.viewportCenter = state.originPoint.slice();
+    state.viewportCenter = initialViewportCenterForOrigin(state.originPoint);
   }
 
   warpToggle.checked = state.showWarp;
