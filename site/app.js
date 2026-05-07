@@ -6,7 +6,9 @@ const MAX_AREA_WEIGHT = 2.67;
 const MIN_VIEWPORT_SCALE = 1;
 const MAX_VIEWPORT_SCALE = 4;
 const DEFAULT_INITIAL_VIEWPORT_SCALE = 2.35;
-const DESKTOP_INITIAL_CENTER_OFFSET_METERS = [-11_000, 0];
+const DESKTOP_INITIAL_ORIGIN_SCREEN_X = 0.78;
+const DESKTOP_INITIAL_ORIGIN_SCREEN_Y = 0.52;
+const DESKTOP_INITIAL_CENTER_FALLBACK_OFFSET_METERS = [-26_000, 0];
 const VIEWPORT_ZOOM_STEP = 1.35;
 const PANEL_PADDING = 18;
 const ROUTE_LINE_WIDTH = 2.2;
@@ -891,9 +893,27 @@ function activeViewportCenter() {
 function initialViewportCenterForOrigin(originPoint) {
   if (!originPoint) return null;
   if (state.isMobile) return originPoint.slice();
+  const bounds = state.data?.meta?.bounds;
+  const rect = mapCanvas.getBoundingClientRect();
+  if (bounds && rect.width > 0 && rect.height > 0) {
+    const [minX, minY, maxX, maxY] = bounds;
+    const spanX = maxX - minX;
+    const spanY = maxY - minY;
+    const baseScale = Math.min(
+      (rect.width - PANEL_PADDING * 2) / spanX,
+      (rect.height - PANEL_PADDING * 2) / spanY,
+    );
+    const scale = baseScale * DEFAULT_INITIAL_VIEWPORT_SCALE;
+    const targetX = rect.width * DESKTOP_INITIAL_ORIGIN_SCREEN_X;
+    const targetY = rect.height * DESKTOP_INITIAL_ORIGIN_SCREEN_Y;
+    return clampViewportCenter([
+      originPoint[0] - (targetX - rect.width / 2) / scale,
+      originPoint[1] + (targetY - rect.height / 2) / scale,
+    ]);
+  }
   return clampViewportCenter([
-    originPoint[0] + DESKTOP_INITIAL_CENTER_OFFSET_METERS[0],
-    originPoint[1] + DESKTOP_INITIAL_CENTER_OFFSET_METERS[1],
+    originPoint[0] + DESKTOP_INITIAL_CENTER_FALLBACK_OFFSET_METERS[0],
+    originPoint[1] + DESKTOP_INITIAL_CENTER_FALLBACK_OFFSET_METERS[1],
   ]);
 }
 
