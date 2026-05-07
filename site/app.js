@@ -62,7 +62,7 @@ const state = {
   showReachOutline: false,
   showPinHint: true,
   isMobile: false,
-  drawerCollapsed: false,
+  drawerCollapsed: true,
   mobileHelpCollapsed: true,
   viewportScale: 1,
   viewportCenter: null,
@@ -2985,6 +2985,7 @@ async function init() {
   state.travelSettings = sanitizeTravelSettings(loadStoredTravelSettings(), state.travelSettingsDefaults);
   state.dynamicAdjacency = buildDynamicAdjacency();
   state.isMobile = isMobileLayout();
+  state.drawerCollapsed = state.isMobile;
   state.baseMapCache = null;
   state.ready = true;
 
@@ -3054,6 +3055,7 @@ async function init() {
 
   resize();
   window.addEventListener("resize", resize);
+  setDrawerCollapsed(state.drawerCollapsed);
 
   mobileWarpToggle.checked = state.showWarp;
   mobileHeatmapToggle.checked = state.showHeatmap;
