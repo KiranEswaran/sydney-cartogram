@@ -109,7 +109,7 @@
           <section class="control-panel time-panel" aria-label="Maximum travel time">
             <div class="panel-row">
               <h2>Maximum travel time</h2>
-              <strong data-setting-value="maxTransitTime">90 min</strong>
+              <strong data-setting-value="maxTransitTime">60 min</strong>
             </div>
             <label class="settings-field">
               <span class="sr-only">Maximum transit time</span>
@@ -186,12 +186,12 @@
             </div>
             <div id="heatmapLegend" class="legend legend-overlay" aria-live="polite">
               <div class="legend-title">Travel time from origin</div>
-              <div class="legend-row"><span class="swatch c1"></span><span>0 - 15 min</span></div>
-              <div class="legend-row"><span class="swatch c2"></span><span>15 - 30 min</span></div>
-              <div class="legend-row"><span class="swatch c3"></span><span>30 - 45 min</span></div>
-              <div class="legend-row"><span class="swatch c4"></span><span>45 - 60 min</span></div>
-              <div class="legend-row"><span class="swatch c5"></span><span>60 - 75 min</span></div>
-              <div class="legend-row"><span class="swatch c6"></span><span>75 - 90 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c1"></span><span>0 - 10 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c2"></span><span>10 - 20 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c3"></span><span>20 - 30 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c4"></span><span>30 - 40 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c5"></span><span>40 - 50 min</span></div>
+              <div class="legend-row" data-legend-range><span class="swatch c6"></span><span>50 - 60 min</span></div>
               <div class="legend-row"><span class="swatch c7"></span><span>up to <span id="heatmapLegendMax">120m</span></span></div>
               <span id="heatmapLegendMin" class="sr-only">0m</span>
               <div class="legend-scale" aria-hidden="true"></div>

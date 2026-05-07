@@ -1,6 +1,6 @@
 const DATA_URL = new URL("./data/commute_map_data.json", import.meta.url).toString();
 const DEFAULT_TRANSIT_TIME_MINUTES = 4;
-const DEFAULT_MAX_TIME_MINUTES = 90;
+const DEFAULT_MAX_TIME_MINUTES = 60;
 const MIN_AREA_WEIGHT = 1;
 const MAX_AREA_WEIGHT = 2.67;
 const MIN_VIEWPORT_SCALE = 1;
@@ -33,14 +33,14 @@ const IMAGE_WARP_OVERDRAW_PX = 0.35;
 const WARP_LINE_CURVE_TOLERANCE_PX = 1.1;
 const WARP_LINE_MAX_SUBDIVISION_DEPTH = 7;
 const DEFAULT_SWIM_METERS_PER_MINUTE = 28;
-const REACHABILITY_THRESHOLD_MINUTES = 90;
+const REACHABILITY_THRESHOLD_MINUTES = 60;
 const SHARE_COORDINATE_DECIMALS = 5;
 const EMOJI_BURST_INTERVAL_MS = 90;
 const EMOJI_BURST_PER_TICK = 3;
 const EMOJI_BURST_LIFETIME_MS = 900;
 const MOBILE_DRAWER_SWIPE_THRESHOLD_PX = 36;
 const METERS_PER_MINUTE_PER_MPH = 26.8224;
-const SETTINGS_STORAGE_KEY = "sydney-cartogram-settings-v3";
+const SETTINGS_STORAGE_KEY = "sydney-cartogram-settings-v4";
 
 const EMOJI_BURST_SETS = {
   github: ["💻", "🖥️", "⌨️", "⚙️", "🧑‍💻"],
@@ -101,6 +101,7 @@ const outlineToggle = document.getElementById("outlineToggle");
 const heatmapLegend = document.getElementById("heatmapLegend");
 const heatmapLegendMin = document.getElementById("heatmapLegendMin");
 const heatmapLegendMax = document.getElementById("heatmapLegendMax");
+const heatmapLegendRanges = Array.from(document.querySelectorAll("[data-legend-range]"));
 const zoomInButton = document.getElementById("zoomInButton");
 const zoomOutButton = document.getElementById("zoomOutButton");
 const fullscreenButton = document.getElementById("fullscreenButton");
@@ -2791,6 +2792,14 @@ function syncHeatmapLegend() {
   heatmapLegend.hidden = !state.showHeatmap;
   heatmapLegendMin.textContent = "0m";
   heatmapLegendMax.textContent = `${Math.round(maxTransitTime)}m`;
+  const step = maxTransitTime / Math.max(1, heatmapLegendRanges.length);
+  heatmapLegendRanges.forEach((row, index) => {
+    const label = row.querySelector("span:last-child");
+    if (!label) return;
+    const start = Math.round(index * step);
+    const end = Math.round((index + 1) * step);
+    label.textContent = `${start} - ${end} min`;
+  });
 }
 
 function syncFullscreenButton() {

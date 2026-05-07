@@ -858,7 +858,7 @@ def main() -> None:
             "static_not_realtime": True,
             "schedule_aware": False,
             "modes_included": modes_present,
-            "default_max_time_minutes": 90,
+            "default_max_time_minutes": 60,
             "max_supported_time_minutes": 120,
             "route_type_mapping": ROUTE_TYPE_TO_MODE,
             "excluded_route_types": dict(skipped_route_types),
