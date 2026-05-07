@@ -3,3 +3,4 @@ data/tfnsw_gtfs_complete.zip
 dist/
 node_modules/
 .vercel/
+recordings/
